@@ -1,0 +1,9 @@
+node_modules/
+public/assets/discuss-it/
+.env
+.env.*
+*.log
+test-results/
+playwright-report/
+.DS_Store
+._*

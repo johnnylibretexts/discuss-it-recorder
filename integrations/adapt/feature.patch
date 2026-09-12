@@ -1,0 +1,1057 @@
+diff --git a/app/Http/Controllers/AssignmentSyncQuestionController.php b/app/Http/Controllers/AssignmentSyncQuestionController.php
+index d17ad773c..5588d9d16 100644
+--- a/app/Http/Controllers/AssignmentSyncQuestionController.php
++++ b/app/Http/Controllers/AssignmentSyncQuestionController.php
+@@ -1983,7 +1983,8 @@ class AssignmentSyncQuestionController extends Controller
+                         'highlight_table',
+                         'matrix_multiple_response',
+                         'ordering',
+-                        'image_hotspot'])) {
++                        'image_hotspot',
++                        'discuss_it'])) {
+                         return $seed;
+                     }
+                     switch ($question_type) {
+diff --git a/app/Http/Controllers/DiscussItController.php b/app/Http/Controllers/DiscussItController.php
+new file mode 100644
+index 000000000..6471b618b
+--- /dev/null
++++ b/app/Http/Controllers/DiscussItController.php
+@@ -0,0 +1,238 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Assignment;
++use App\Question;
++use App\Services\DiscussIt;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Storage;
++use Illuminate\Support\Str;
++use Illuminate\Support\Facades\URL;
++
++class DiscussItController extends Controller
++{
++    public function index(Assignment $assignment, Question $question, DiscussIt $discuss)
++    {
++        $scope = $discuss->scope($assignment, $question);
++        $comments = [];
++        if ($scope['settings']['enabled'] || $scope['owner']) {
++            $comments = $discuss->comments($assignment, $question, $scope)->orderBy('id')->limit(500)->get()->map(function ($row) use ($scope) {
++                $user = DB::table('users')->where('id', $row->user_id)->first();
++                $graded = DB::table('submission_files')->where('assignment_id', $row->assignment_id)->where('question_id', $row->question_id)->where('user_id', $row->user_id)->whereNotNull('date_graded')->exists();
++                $row->author = $user ? trim($user->first_name.' '.$user->last_name) : 'Former participant';
++                $row->can_edit = !$row->deleted_at && !$graded && (int) $row->user_id === (int) request()->user()->id && $scope['settings']['allow_edit'];
++                $row->can_delete = !$row->deleted_at && ($scope['owner'] || (!$graded && (int) $row->user_id === (int) request()->user()->id && $scope['settings']['allow_delete']));
++                if ($row->deleted_at) { $row->text = '[Removed]'; $row->media_id = null; $row->captions = null; }
++                unset($row->request_id);
++                return $row;
++            });
++        }
++        return response()->json(array_merge($scope, ['comments' => $comments,
++            'completion' => $discuss->completion($assignment, $question, request()->user()->id, $scope['settings']),
++            'prompt' => json_decode($question->qti_json, true)['prompt'] ?? '', 'title' => $question->title]));
++    }
++
++    public function settings(Request $request, Assignment $assignment, Question $question, DiscussIt $discuss)
++    {
++        $scope = $discuss->scope($assignment, $question);
++        abort_unless($scope['owner'], 403);
++        $settings = $request->validate(['enabled' => 'required|boolean', 'auto_grade' => 'required|boolean',
++            'min_threads' => 'required|integer|min:0|max:20', 'min_replies' => 'required|integer|min:0|max:20',
++            'min_words' => 'required|integer|min:1|max:1000', 'min_seconds' => 'required|integer|min:0|max:300',
++            'allow_edit' => 'required|boolean', 'allow_delete' => 'required|boolean', 'group_by_section' => 'required|boolean']);
++        // Serialize settings with comment writes. Freeze scoring/group rules once work exists.
++        DB::transaction(function () use ($assignment, $question, $settings, $scope) {
++            DB::table('assignment_question')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->lockForUpdate()->first();
++            if (DB::table('discuss_it_comments')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->exists()) {
++                foreach (['auto_grade', 'min_threads', 'min_replies', 'min_words', 'min_seconds', 'group_by_section'] as $key) {
++                    abort_unless($settings[$key] == $scope['settings'][$key], 422, 'Completion and group rules cannot change after a response has been posted.');
++                }
++            }
++            DB::table('discuss_it_settings')->updateOrInsert(['assignment_id' => $assignment->id, 'question_id' => $question->id], ['settings' => json_encode($settings), 'created_at' => now(), 'updated_at' => now()]);
++        });
++        return $this->index($assignment, $question, $discuss);
++    }
++
++    public function store(Request $request, Assignment $assignment, Question $question, DiscussIt $discuss)
++    {
++        $discuss->scope($assignment, $question, true);
++        $data = $request->validate(['request_id' => 'required|uuid', 'parent_id' => 'nullable|integer',
++            'media_id' => 'nullable|uuid', 'text' => 'nullable|string|max:10000', 'captions' => 'nullable|string|max:20000', 'group_key' => 'nullable|string|max:80']);
++        abort_unless(!empty($data['media_id']) || trim($data['text'] ?? '') !== '', 422, 'Write a response or attach a recording.');
++        $id = DB::transaction(function () use ($data, $assignment, $question, $discuss) {
++            DB::table('assignment_question')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->lockForUpdate()->first();
++            $scope = $discuss->scope($assignment, $question, true);
++            $prior = DB::table('discuss_it_comments')->where('user_id', request()->user()->id)->where('request_id', $data['request_id'])->first();
++            if ($prior) {
++                abort_unless($prior->assignment_id == $assignment->id && $prior->question_id == $question->id, 409);
++                return $prior->id;
++            }
++            $group = $scope['group'];
++            if (!empty($data['parent_id'])) {
++                $parent = $discuss->comments($assignment, $question, $scope)->where('id', $data['parent_id'])->whereNull('parent_id')->whereNull('deleted_at')->first();
++                abort_unless($parent, 422, 'That thread is not available.');
++                $group = $parent->group_key;
++            } elseif ($scope['owner'] && $scope['settings']['group_by_section']) {
++                $sectionId = (int) str_replace('section:', '', $data['group_key'] ?? '');
++                abort_unless(DB::table('sections')->where('course_id', $assignment->course_id)->where('id', $sectionId)->exists(), 422, 'Choose a course section for this thread.');
++                $group = 'section:'.$sectionId;
++            }
++            $media = null;
++            if (!empty($data['media_id'])) {
++                $media = $this->ownedMedia($data['media_id'], $assignment, $question);
++                abort_unless($media->status === 'ready', 422, 'Recording is not ready yet.');
++                abort_if(DB::table('discuss_it_comments')->where('media_id', $media->id)->exists(), 409, 'This recording has already been posted.');
++            }
++            $id = DB::table('discuss_it_comments')->insertGetId([
++                'assignment_id' => $assignment->id, 'question_id' => $question->id, 'user_id' => request()->user()->id,
++                'group_key' => $group, 'request_id' => $data['request_id'], 'parent_id' => $data['parent_id'] ?? null,
++                'media_id' => $media ? $media->id : null, 'text' => $data['text'] ?? null,
++                'captions' => $data['captions'] ?? null, 'satisfied' => $discuss->satisfied($data['text'] ?? null, $media, $scope['settings']),
++                'created_at' => now(), 'updated_at' => now()]);
++            $discuss->grade($assignment, $question, $scope);
++            return $id;
++        });
++        return response()->json(['id' => $id]);
++    }
++
++    public function update(Request $request, Assignment $assignment, Question $question, int $comment, DiscussIt $discuss)
++    {
++        $scope = $discuss->scope($assignment, $question, true);
++        $data = $request->validate(['text' => 'nullable|string|max:10000', 'captions' => 'nullable|string|max:20000']);
++        $this->mutate($assignment, $question, $comment, $scope, $discuss, false, $data);
++        return response()->json(['saved' => true]);
++    }
++
++    public function destroy(Assignment $assignment, Question $question, int $comment, DiscussIt $discuss)
++    {
++        $scope = $discuss->scope($assignment, $question, true);
++        $this->mutate($assignment, $question, $comment, $scope, $discuss, true, []);
++        return response()->json(['removed' => true]);
++    }
++
++    private function mutate($assignment, $question, $comment, $scope, $discuss, $delete, $data)
++    {
++        DB::transaction(function () use ($assignment, $question, $comment, $scope, $discuss, $delete, $data) {
++            DB::table('assignment_question')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->lockForUpdate()->first();
++            $row = $discuss->comments($assignment, $question, $scope)->where('id', $comment)->whereNull('deleted_at')->first();
++            abort_unless($row, 404);
++            $moderation = $delete && $scope['owner'];
++            abort_unless($moderation || ((int) $row->user_id === (int) request()->user()->id && $scope['settings'][$delete ? 'allow_delete' : 'allow_edit']), 403);
++            $graded = DB::table('submission_files')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->where('user_id', $row->user_id)->whereNotNull('date_graded')->exists();
++            abort_if($graded && !$moderation, 403, 'Graded responses cannot be changed.');
++            if ($delete) $values = ['deleted_at' => now()];
++            else {
++                abort_unless($row->media_id || trim($data['text'] ?? '') !== '', 422, 'A response cannot be empty.');
++                $media = $row->media_id ? DB::table('discuss_it_media')->where('id', $row->media_id)->first() : null;
++                $values = ['text' => $data['text'] ?? null, 'captions' => $data['captions'] ?? null,
++                    'satisfied' => $discuss->satisfied($data['text'] ?? null, $media, $scope['settings'])];
++            }
++            DB::table('discuss_it_comments')->where('id', $comment)->update(array_merge($values, ['updated_at' => now()]));
++            if (!$delete) $discuss->grade($assignment, $question, $scope);
++        });
++    }
++
++    public function upload(Request $request, Assignment $assignment, Question $question, DiscussIt $discuss)
++    {
++        $discuss->scope($assignment, $question, true);
++        $data = $request->validate(['kind' => 'required|in:audio,video', 'size' => 'required|integer|min:1|max:80000000']);
++        $userId = $request->user()->id;
++        abort_if(DB::table('discuss_it_media')->where('user_id', $userId)->whereIn('status', ['uploading', 'pending', 'processing'])->where('created_at', '>', now()->subHours(2))->count() >= 3, 429, 'Finish a pending upload before starting another.');
++        $id = (string) Str::uuid();
++        $key = "discuss-it/{$assignment->id}/{$question->id}/{$userId}/{$id}/input";
++        DB::table('discuss_it_media')->insert(['id' => $id, 'assignment_id' => $assignment->id, 'question_id' => $question->id, 'user_id' => $userId,
++            'object_key' => $key, 'kind' => $data['kind'], 'status' => 'uploading', 'created_at' => now(), 'updated_at' => now()]);
++        // MinIO is deliberately internal-only in this deployment. Stream through
++        // an authenticated, bounded same-origin PUT instead of exposing its host.
++        return response()->json(['id' => $id, 'url' => "/api/discuss-it/{$assignment->id}/{$question->id}/media/{$id}/content"]);
++    }
++
++    public function content(Request $request, Assignment $assignment, Question $question, string $media, DiscussIt $discuss)
++    {
++        $discuss->scope($assignment, $question, true);
++        $row = $this->ownedMedia($media, $assignment, $question);
++        abort_unless($row->status === 'uploading', 409, 'Upload is already being processed.');
++        abort_unless($row->created_at > now()->subHours(2)->toDateTimeString(), 410, 'Upload expired.');
++        abort_if((int) $request->header('Content-Length', 0) > 80000000, 413);
++        $source = $request->getContent(true);
++        $temporary = tmpfile();
++        try {
++            $size = stream_copy_to_stream($source, $temporary, 80000001);
++            abort_unless($size > 0 && $size <= 80000000, 413, 'Recording must be under 80 MB.');
++            rewind($temporary);
++            abort_unless(Storage::disk('s3')->put($row->object_key, $temporary, ['visibility' => 'private']), 503, 'Upload storage is unavailable. Please retry.');
++        } finally { fclose($source); fclose($temporary); }
++        return response()->json(['uploaded' => true]);
++    }
++
++    private function ownedMedia($id, $assignment, $question)
++    {
++        $media = DB::table('discuss_it_media')->where('id', $id)->where('assignment_id', $assignment->id)->where('question_id', $question->id)->where('user_id', request()->user()->id)->first();
++        abort_unless($media, 404);
++        return $media;
++    }
++
++    public function finalize(Assignment $assignment, Question $question, string $media, DiscussIt $discuss)
++    {
++        $discuss->scope($assignment, $question, true);
++        $row = $this->ownedMedia($media, $assignment, $question);
++        abort_unless($row->created_at > now()->subHours(2)->toDateTimeString(), 410, 'Upload expired. Please upload again.');
++        if ($row->status === 'uploading') {
++            abort_unless(Storage::disk('s3')->exists($row->object_key), 422, 'Upload has not completed.');
++            abort_if(Storage::disk('s3')->size($row->object_key) > 80000000, 422, 'Video exceeds 80 MB.');
++            DB::table('discuss_it_media')->where('id', $media)->where('status', 'uploading')->update(['status' => 'pending', 'updated_at' => now()]);
++        }
++        return response()->json(['accepted' => true], 202);
++    }
++
++    public function media(Assignment $assignment, Question $question, string $media, DiscussIt $discuss)
++    {
++        $scope = $discuss->scope($assignment, $question);
++        $row = DB::table('discuss_it_media')->where('id', $media)->where('assignment_id', $assignment->id)->where('question_id', $question->id)->first();
++        abort_unless($row, 404);
++        $own = (int) $row->user_id === (int) request()->user()->id;
++        abort_unless($scope['settings']['enabled'] || $scope['owner'], 403);
++        abort_unless($own || $discuss->comments($assignment, $question, $scope)->where('media_id', $media)->whereNull('deleted_at')->exists(), 404);
++        return response()->json(['status' => $row->status, 'error' => $row->error, 'kind' => $row->kind, 'duration_ms' => $row->duration_ms,
++            'url' => $row->status === 'ready' ? URL::temporarySignedRoute('discuss-it.playback', now()->addMinutes(15), ['media' => $media, 'viewer' => request()->user()->id]) : null])->header('Cache-Control', 'private, no-store');
++    }
++
++    public function playback(Request $request, string $media, DiscussIt $discuss)
++    {
++        // This endpoint is guarded by Laravel's signed middleware. Recheck the
++        // signed viewer's current access so unenrollment/group changes take effect.
++        $viewer = \App\User::findOrFail((int) $request->query('viewer'));
++        auth()->setUser($viewer);
++        $request->setUserResolver(function () use ($viewer) { return $viewer; });
++        $row = DB::table('discuss_it_media')->where('id', $media)->where('status', 'ready')->first();
++        abort_unless($row, 404);
++        $assignment = Assignment::findOrFail($row->assignment_id);
++        $question = Question::findOrFail($row->question_id);
++        $scope = $discuss->scope($assignment, $question);
++        abort_unless($scope['settings']['enabled'] || $scope['owner'], 403);
++        abort_unless((int) $row->user_id === (int) $viewer->id || $discuss->comments($assignment, $question, $scope)->where('media_id', $media)->whereNull('deleted_at')->exists(), 404);
++        $disk = Storage::disk('s3');
++        $size = $disk->size($row->output_key);
++        $start = 0; $end = $size - 1; $status = 200;
++        if ($request->hasHeader('Range')) {
++            $range = $request->header('Range');
++            if (!preg_match('/^bytes=(\d*)-(\d*)$/D', $range, $match) || ($match[1] === '' && $match[2] === '')) return response('', 416)->header('Content-Range', 'bytes */'.$size);
++            if ($match[1] === '') $start = max(0, $size - (int) $match[2]);
++            else { $start = (int) $match[1]; if ($match[2] !== '') $end = min($end, (int) $match[2]); }
++            if ($start > $end || $start >= $size) return response('', 416)->header('Content-Range', 'bytes */'.$size);
++            $status = 206;
++        }
++        $adapter = $disk->getDriver()->getAdapter();
++        $object = $adapter->getClient()->getObject(['Bucket' => $adapter->getBucket(), 'Key' => $row->output_key, 'Range' => "bytes={$start}-{$end}"]);
++        $headers = ['Content-Type' => $row->kind === 'video' ? 'video/mp4' : 'audio/mp4', 'Content-Length' => (string) ($end - $start + 1),
++            'Accept-Ranges' => 'bytes', 'Cache-Control' => 'private, no-store', 'X-Content-Type-Options' => 'nosniff'];
++        if ($status === 206) $headers['Content-Range'] = "bytes {$start}-{$end}/{$size}";
++        return response()->stream(function () use ($object) {
++            $stream = $object['Body'];
++            try { while (!$stream->eof()) { echo $stream->read(65536); if (connection_aborted()) break; } }
++            finally { $stream->close(); }
++        }, $status, $headers);
++    }
++}
+diff --git a/app/Http/Kernel.php b/app/Http/Kernel.php
+index 233ba58c9..9392b67af 100644
+--- a/app/Http/Kernel.php
++++ b/app/Http/Kernel.php
+@@ -17,7 +17,7 @@ class Kernel extends HttpKernel
+         \App\Http\Middleware\TrustProxies::class,
+         \Fruitcake\Cors\HandleCors::class,
+         \App\Http\Middleware\CheckForMaintenanceMode::class,
+-        \Illuminate\Foundation\Http\Middleware\ValidatePostSize::class,
++        \App\Http\Middleware\ValidateDiscussItPostSize::class,
+         \App\Http\Middleware\TrimStrings::class,
+         \Illuminate\Session\Middleware\StartSession::class,
+         \Illuminate\Foundation\Http\Middleware\ConvertEmptyStringsToNull::class,
+diff --git a/app/Http/Middleware/ValidateDiscussItPostSize.php b/app/Http/Middleware/ValidateDiscussItPostSize.php
+new file mode 100644
+index 000000000..a58eb7f74
+--- /dev/null
++++ b/app/Http/Middleware/ValidateDiscussItPostSize.php
+@@ -0,0 +1,21 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use Closure;
++use Illuminate\Foundation\Http\Middleware\ValidatePostSize;
++use Illuminate\Http\Exceptions\PostTooLargeException;
++
++class ValidateDiscussItPostSize extends ValidatePostSize
++{
++    public function handle($request, Closure $next)
++    {
++        // Only this authenticated streaming PUT has the larger video limit.
++        // Preserve the existing PHP-derived limit for all other ADAPT requests.
++        if ($request->isMethod('PUT') && $request->is('api/discuss-it/*/*/media/*/content')) {
++            if ((int) $request->server('CONTENT_LENGTH', 0) > 80000000) throw new PostTooLargeException();
++            return $next($request);
++        }
++        return parent::handle($request, $next);
++    }
++}
+diff --git a/app/Http/Requests/StoreQuestionRequest.php b/app/Http/Requests/StoreQuestionRequest.php
+index 96a8c219c..77c5b1a72 100644
+--- a/app/Http/Requests/StoreQuestionRequest.php
++++ b/app/Http/Requests/StoreQuestionRequest.php
+@@ -120,6 +120,9 @@ class StoreQuestionRequest extends FormRequest
+                         case('qti'):
+                             $qti_array = json_decode($this->qti_json, true);
+                             switch ($qti_array['questionType']) {
++                                case('discuss_it'):
++                                    $rules['qti_prompt'] = ['required', 'string', 'max:20000'];
++                                    break;
+                                 case('ordering'):
+                                     $rules['qti_prompt'] = ['required'];
+                                     $rules['responses'] = ['required', 'array', 'min:3', 'max:20'];
+diff --git a/app/Question.php b/app/Question.php
+index 1b3af3c46..e802494ae 100644
+--- a/app/Question.php
++++ b/app/Question.php
+@@ -529,6 +529,8 @@ class Question extends Model
+             }
+         }
+         switch ($question_type) {
++            case('discuss_it'):
++                break;
+             case('highlight_table'):
+                 if ($student_response) {
+                     $student_response = json_decode($student_response, 1);
+diff --git a/app/Submission.php b/app/Submission.php
+index 06cd9530e..84273a1f3 100644
+--- a/app/Submission.php
++++ b/app/Submission.php
+@@ -576,6 +576,10 @@ class Submission extends Model
+         $data = $request;
+ 
+         $data['user_id'] = Auth::user()->id;
++        $discussionQuestion = Question::find($data['question_id']);
++        if ($discussionQuestion && (json_decode($discussionQuestion->qti_json ?? '{}', true)['questionType'] ?? '') === 'discuss_it') {
++            return ['type' => 'error', 'message' => 'Submit Discuss-It responses through the discussion. Completion is checked by the server.'];
++        }
+         $assignment = $Assignment->find($data['assignment_id']);
+ 
+ 
+diff --git a/app/Services/DiscussIt.php b/app/Services/DiscussIt.php
+new file mode 100644
+index 000000000..74033169e
+--- /dev/null
++++ b/app/Services/DiscussIt.php
+@@ -0,0 +1,88 @@
++<?php
++
++namespace App\Services;
++
++use App\Assignment;
++use App\Question;
++use App\Score;
++use App\Submission;
++use App\SubmissionFile;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Gate;
++
++class DiscussIt
++{
++    public static function defaults(): array
++    {
++        return ['enabled' => false, 'min_threads' => 1, 'min_replies' => 0,
++            'min_words' => 1, 'min_seconds' => 0, 'auto_grade' => false,
++            'allow_edit' => true, 'allow_delete' => true, 'group_by_section' => false];
++    }
++
++    public function scope(Assignment $assignment, Question $question, bool $write = false): array
++    {
++        $user = request()->user();
++        abort_unless($user, 401);
++        abort_unless(DB::table('assignment_question')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->exists(), 404);
++        abort_unless($question->technology === 'qti' && (json_decode($question->qti_json, true)['questionType'] ?? '') === 'discuss_it', 404);
++        $owner = (int) $assignment->course->user_id === (int) $user->id;
++        $enrollment = DB::table('enrollments')->where('course_id', $assignment->course_id)->where('user_id', $user->id)->first();
++        // Public question previews must never expose private discussion content.
++        abort_unless($owner || ((int) $user->role === 3 && $enrollment), 403);
++        if (!$owner) {
++            abort_unless($assignment->shown, 403, 'This assignment is not available.');
++            $timing = $assignment->assignToTimingByUser();
++            abort_unless($timing && strtotime($timing->available_from) <= time(), 403, 'This assignment is not available yet.');
++        }
++        $row = DB::table('discuss_it_settings')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->first();
++        $settings = array_merge(self::defaults(), $row ? json_decode($row->settings, true) : []);
++        if ($write) {
++            abort_unless($settings['enabled'], 403, 'This discussion is not enabled.');
++            if (!$owner) Gate::authorize('store', [new Submission(), $assignment, $assignment->id, $question->id]);
++        }
++        $group = $settings['group_by_section'] && !$owner ? 'section:'.($enrollment->section_id ?? 0) : 'all';
++        return compact('owner', 'settings', 'group');
++    }
++
++    public function comments(Assignment $assignment, Question $question, array $scope)
++    {
++        $query = DB::table('discuss_it_comments')->where('assignment_id', $assignment->id)->where('question_id', $question->id);
++        if (!$scope['owner']) $query->where('group_key', $scope['group']);
++        return $query;
++    }
++
++    public function satisfied(?string $text, $media, array $settings): bool
++    {
++        if ($media) return $media->duration_ms >= 1000 * $settings['min_seconds'];
++        return count(preg_split('/\s+/u', trim($text ?? ''), -1, PREG_SPLIT_NO_EMPTY)) >= $settings['min_words'];
++    }
++
++    public function completion(Assignment $assignment, Question $question, int $userId, array $settings): array
++    {
++        $query = DB::table('discuss_it_comments')->where('assignment_id', $assignment->id)->where('question_id', $question->id)
++            ->where('user_id', $userId)->whereNull('deleted_at')->where('satisfied', true);
++        $threads = (clone $query)->whereNull('parent_id')->count();
++        $replies = (clone $query)->whereNotNull('parent_id')->count();
++        return ['threads' => $threads, 'replies' => $replies,
++            'complete' => ($threads + $replies > 0) && $threads >= $settings['min_threads'] && $replies >= $settings['min_replies']];
++    }
++
++    public function grade(Assignment $assignment, Question $question, array $scope): void
++    {
++        if ($scope['owner'] || !$scope['settings']['auto_grade']) return;
++        $userId = request()->user()->id;
++        if (!$this->completion($assignment, $question, $userId, $scope['settings'])['complete']) return;
++        $points = DB::table('assignment_question')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->value('points');
++        $submission = SubmissionFile::firstOrNew(['assignment_id' => $assignment->id, 'question_id' => $question->id, 'user_id' => $userId]);
++        if ($submission->exists) return;
++        // Use this fork's existing question-level submission type; no enum rewrite.
++        $submission->type = 'q';
++        $submission->original_filename = '';
++        $submission->submission = '';
++        $submission->date_submitted = now();
++        $submission->date_graded = now();
++        $submission->score = (new Submission())->applyLatePenalyToScore($assignment, $points);
++        $submission->save();
++        (new Score())->updateAssignmentScore($userId, $assignment->id);
++    }
++}
+diff --git a/app/Services/DiscussItMediaProcessor.php b/app/Services/DiscussItMediaProcessor.php
+new file mode 100644
+index 000000000..d46d2d3ba
+--- /dev/null
++++ b/app/Services/DiscussItMediaProcessor.php
+@@ -0,0 +1,68 @@
++<?php
++
++namespace App\Services;
++
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Storage;
++use Symfony\Component\Process\Process;
++
++class DiscussItMediaProcessor
++{
++    private function run(array $arguments, int $timeout): string
++    {
++        $process = new Process($arguments);
++        $process->setTimeout($timeout);
++        $process->mustRun();
++        return $process->getOutput();
++    }
++
++    public function process($media): void
++    {
++        $input = tempnam(sys_get_temp_dir(), 'discuss-input-');
++        $output = tempnam(sys_get_temp_dir(), 'discuss-output-');
++        $disk = Storage::disk('s3');
++        try {
++            $size = $disk->size($media->object_key);
++            if ($size < 1 || $size > 80000000) throw new \RuntimeException('Invalid size');
++            $source = $disk->readStream($media->object_key);
++            $destination = fopen($input, 'wb');
++            try { $copied = stream_copy_to_stream($source, $destination, 80000001); }
++            finally { if (is_resource($source)) fclose($source); fclose($destination); }
++            if ($copied > 80000000 || !$copied) throw new \RuntimeException('Invalid input');
++            $formats = 'mov,matroska,webm,mp3,wav,ogg,aac';
++            $probe = json_decode($this->run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-format_whitelist', $formats, '-show_streams', '-show_format', '-of', 'json', $input], 15), true);
++            $audio = false;
++            $video = false;
++            foreach ($probe['streams'] ?? [] as $stream) {
++                if ($stream['codec_type'] === 'audio') $audio = true;
++                if ($stream['codec_type'] === 'video') {
++                    $video = true;
++                    if (($stream['width'] ?? 0) * ($stream['height'] ?? 0) > 9000000) throw new \RuntimeException('Resolution too large');
++                }
++            }
++            if (!$audio || ($media->kind === 'video' && !$video)) throw new \RuntimeException('Missing tracks');
++            if (isset($probe['format']['duration']) && (float) $probe['format']['duration'] > 301) throw new \RuntimeException('Too long');
++            $arguments = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-threads', '2', '-filter_threads', '1', '-protocol_whitelist', 'file', '-format_whitelist', $formats, '-i', $input, '-t', '301'];
++            if ($media->kind === 'video') {
++                $arguments = array_merge($arguments, ['-map', '0:v:0', '-map', '0:a:0', '-vf', "scale=trunc(iw/2)*2:trunc(ih/2)*2", '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25', '-pix_fmt', 'yuv420p', '-threads', '2']);
++            } else $arguments = array_merge($arguments, ['-vn', '-map', '0:a:0']);
++            $arguments = array_merge($arguments, ['-c:a', 'aac', '-b:a', '96k', '-ac', '1', '-map_metadata', '-1', '-movflags', '+faststart', '-f', 'mp4', $output]);
++            $this->run($arguments, 180);
++            $duration = (float) trim($this->run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', $output], 15));
++            if ($duration < 0.1 || $duration > 300.5 || filesize($output) > 80000000) throw new \RuntimeException('Invalid output');
++            $key = dirname($media->object_key).'/recording.'.($media->kind === 'video' ? 'mp4' : 'm4a');
++            $stream = fopen($output, 'rb');
++            try {
++                if (!$disk->put($key, $stream, ['visibility' => 'private', 'ContentType' => $media->kind === 'video' ? 'video/mp4' : 'audio/mp4'])) throw new \RuntimeException('Storage failed');
++            } finally { fclose($stream); }
++            DB::table('discuss_it_media')->where('id', $media->id)->update(['status' => 'ready', 'output_key' => $key, 'duration_ms' => (int) round($duration * 1000), 'error' => null, 'updated_at' => now()]);
++            $disk->delete($media->object_key);
++        } catch (\Throwable $error) {
++            DB::table('discuss_it_media')->where('id', $media->id)->update(['status' => 'failed', 'error' => 'Could not process this recording. Use a clip under 5 minutes / 80 MB with microphone audio, then upload again.', 'updated_at' => now()]);
++            // Do not log signed URLs, student media, or ffmpeg input diagnostics.
++        } finally {
++            if (is_file($input)) unlink($input);
++            if (is_file($output)) unlink($output);
++        }
++    }
++}
+diff --git a/app/Console/Commands/LibreTexts/ProcessDiscussItMedia.php b/app/Console/Commands/LibreTexts/ProcessDiscussItMedia.php
+new file mode 100644
+index 000000000..6199a8de4
+--- /dev/null
++++ b/app/Console/Commands/LibreTexts/ProcessDiscussItMedia.php
+@@ -0,0 +1,32 @@
++<?php
++
++namespace App\Console\Commands\LibreTexts;
++
++use App\Services\DiscussItMediaProcessor;
++use Illuminate\Console\Command;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Storage;
++
++class ProcessDiscussItMedia extends Command
++{
++    protected $signature = 'discuss-it:process-media {--once : Process at most one item}';
++    protected $description = 'Process bounded Discuss-It media jobs and remove expired unreferenced uploads.';
++
++    public function handle(DiscussItMediaProcessor $processor)
++    {
++        // Only this feature's rows/objects are eligible; never traverse shared storage.
++        DB::table('discuss_it_media')->where('status', 'processing')->where('updated_at', '<', now()->subMinutes(10))
++            ->update(['status' => 'failed', 'error' => 'Processing was interrupted. Please upload again.', 'updated_at' => now()]);
++        foreach (DB::table('discuss_it_media')->where('created_at', '<', now()->subDays(7))->whereNotExists(function ($query) {
++            $query->select(DB::raw(1))->from('discuss_it_comments')->whereColumn('media_id', 'discuss_it_media.id');
++        })->limit(20)->get() as $expired) {
++            Storage::disk('s3')->delete(array_filter([$expired->object_key, $expired->output_key]));
++            DB::table('discuss_it_media')->where('id', $expired->id)->delete();
++        }
++        $jobs = DB::table('discuss_it_media')->where('status', 'pending')->orderBy('created_at')->limit($this->option('once') ? 1 : 3)->get();
++        foreach ($jobs as $job) {
++            if (DB::table('discuss_it_media')->where('id', $job->id)->where('status', 'pending')->update(['status' => 'processing', 'updated_at' => now()])) $processor->process($job);
++        }
++        return 0;
++    }
++}
+diff --git a/database/migrations/2026_09_09_000001_create_discuss_it_tables.php b/database/migrations/2026_09_09_000001_create_discuss_it_tables.php
+new file mode 100644
+index 000000000..d38430ef8
+--- /dev/null
++++ b/database/migrations/2026_09_09_000001_create_discuss_it_tables.php
+@@ -0,0 +1,56 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++class CreateDiscussItTables extends Migration
++{
++    public function up()
++    {
++        Schema::create('discuss_it_settings', function (Blueprint $table) {
++            $table->id();
++            $table->unsignedBigInteger('assignment_id');
++            $table->unsignedBigInteger('question_id');
++            $table->text('settings');
++            $table->unique(['assignment_id', 'question_id']);
++            $table->timestamps();
++        });
++        Schema::create('discuss_it_media', function (Blueprint $table) {
++            $table->uuid('id')->primary();
++            $table->unsignedBigInteger('assignment_id');
++            $table->unsignedBigInteger('question_id');
++            $table->unsignedBigInteger('user_id');
++            $table->string('object_key');
++            $table->string('output_key')->nullable();
++            $table->string('kind', 10);
++            $table->string('status', 20)->default('uploading')->index();
++            $table->unsignedInteger('duration_ms')->nullable();
++            $table->string('error')->nullable();
++            $table->timestamps();
++        });
++        Schema::create('discuss_it_comments', function (Blueprint $table) {
++            $table->id();
++            $table->unsignedBigInteger('assignment_id');
++            $table->unsignedBigInteger('question_id');
++            $table->unsignedBigInteger('user_id');
++            $table->unsignedBigInteger('parent_id')->nullable();
++            $table->string('group_key', 80)->default('all');
++            $table->uuid('request_id');
++            $table->uuid('media_id')->nullable()->unique();
++            $table->text('text')->nullable();
++            $table->text('captions')->nullable();
++            $table->boolean('satisfied')->default(false);
++            $table->timestamps();
++            $table->softDeletes();
++            $table->unique(['user_id', 'request_id']);
++            $table->index(['assignment_id', 'question_id', 'group_key'], 'discuss_it_scope');
++        });
++    }
++
++    public function down()
++    {
++        // Deliberately no destructive rollback after people have submitted work.
++        throw new RuntimeException('Disable Discuss-It and restore the previous image; retain discussion data.');
++    }
++}
+diff --git a/resources/js/components/QtiJsonQuestionViewer.vue b/resources/js/components/QtiJsonQuestionViewer.vue
+index e43d709e4..285934d66 100644
+--- a/resources/js/components/QtiJsonQuestionViewer.vue
++++ b/resources/js/components/QtiJsonQuestionViewer.vue
+@@ -1,5 +1,5 @@
+ <template>
+-  <div class="pb-3 pr-3 pl-3 pt-2">
++  <div class="pb-3 pr-3 pl-3 pt-2" :class="{ 'discuss-it-question': questionType === 'discuss_it' }">
+     <b-modal
+       id="modal-submission-error"
+       title="Submission Not Accepted"
+@@ -19,6 +19,9 @@
+       Students will receive a randomized ordering of possible responses.
+     </b-alert>
+     <div :id="showQtiAnswer ? 'answer' : 'question'">
++      <DiscussItViewer v-if="questionType === 'discuss_it' && !showQtiAnswer"
++                       :assignment-id="assignmentId" :question-id="questionId" :qti-json="question" />
++      <p v-if="questionType === 'discuss_it' && showQtiAnswer">Discuss-It is evaluated using participation requirements, not a single correct answer.</p>
+       <SelectChoiceDropDownRationaleViewer v-if="['select_choice','drop_down_rationale','drop_down_rationale_triad'].includes(questionType)"
+                                            ref="dropDownTableViewer"
+                                            :qti-json="JSON.parse(qtiJson)"
+@@ -131,7 +134,7 @@
+         :qti-json="JSON.parse(qtiJson)"
+         :show-response-feedback="showResponseFeedback"
+       />
+-      <b-button v-if="showSubmit"
++      <b-button v-if="showSubmit && questionType !== 'discuss_it'"
+                 variant="primary"
+                 :disabled="!submitButtonActive"
+                 size="sm"
+@@ -139,7 +142,7 @@
+       >
+         Submit
+       </b-button>
+-      <b-button v-if="showResetResponse"
++      <b-button v-if="showResetResponse && questionType !== 'discuss_it'"
+                 variant="info"
+                 size="sm"
+                 @click="$emit('resetResponse')"
+@@ -183,10 +186,12 @@ import MultipleChoiceTrueFalseViewer from './viewers/MultipleChoiceTrueFalseView
+ import MatrixMultipleResponseViewer from './viewers/MatrixMultipleResponseViewer'
+ import OrderingViewer from './viewers/OrderingViewer'
+ import ImageHotspotViewer from './viewers/ImageHotspotViewer'
++import DiscussItViewer from './viewers/DiscussItViewer'
+ 
+ export default {
+   name: 'QtiJsonQuestionViewer',
+   components: {
++    DiscussItViewer,
+     ImageHotspotViewer,
+     OrderingViewer,
+     MatrixMultipleResponseViewer,
+@@ -206,6 +211,8 @@ export default {
+     DragAndDropClozeViewer
+   },
+   props: {
++    assignmentId: { type: [Number, String], default: 0 },
++    questionId: { type: [Number, String], default: 0 },
+     qtiJson: {
+       type: String,
+       default: ''
+@@ -263,6 +270,8 @@ export default {
+     this.questionType = this.question.questionType
+     console.log(this.question)
+     switch (this.questionType) {
++      case ('discuss_it'):
++        break
+       case ('numerical'):
+       case ('matching') :
+       case ('multiple_answers'):
+@@ -500,6 +509,11 @@ export default {
+ }
+ </script>
+ <style scoped>
++@media (max-width: 767px) {
++  .discuss-it-question { padding-left: 0 !important; padding-right: 0 !important; }
++}
++</style>
++<style scoped>
+ .inline-form-control {
+   width: auto;
+   display: inline-block;
+diff --git a/resources/js/components/questions/CreateQuestion.vue b/resources/js/components/questions/CreateQuestion.vue
+index e296055ca..dfa701f24 100644
+--- a/resources/js/components/questions/CreateQuestion.vue
++++ b/resources/js/components/questions/CreateQuestion.vue
+@@ -881,6 +881,9 @@
+         </b-form-group>
+         <b-form-group>
+           <div v-if="['all','basic'].includes(nativeType)">
++            <b-form-radio v-model="qtiQuestionType" name="qti-question-type" value="discuss_it" @change="initQTIQuestionType($event)">
++              Discuss-It (text, audio, and video discussion)
++            </b-form-radio>
+             <b-form-radio v-model="qtiQuestionType" name="qti-question-type" value="multiple_choice"
+                           @change="initQTIQuestionType($event)"
+             >
+@@ -1145,6 +1148,7 @@
+                  'highlight_text',
+                  'highlight_table',
+                  'ordering',
++                 'discuss_it',
+                  'image_hotspot'].includes(qtiQuestionType) && qtiJson"
+           class="mb-2"
+         >
+@@ -2206,6 +2210,7 @@ export default {
+           case ('multiple_response_select_all_that_apply'):
+           case ('bow_tie'):
+           case ('ordering'):
++          case ('discuss_it'):
+             this.qtiQuestionType = this.qtiJson.questionType
+             break
+           case ('image_hotspot'):
+@@ -2666,6 +2671,9 @@ export default {
+             ]
+           }
+           break
++        case ('discuss_it'):
++          this.qtiJson = { questionType: 'discuss_it', prompt: '' }
++          break
+         case ('image_hotspot'):
+           this.qtiJson = {
+             questionType: 'image_hotspot',
+@@ -3220,6 +3228,10 @@ export default {
+           }
+         }
+         switch (this.qtiQuestionType) {
++          case ('discuss_it'):
++            this.questionForm.qti_prompt = this.qtiJson.prompt
++            this.questionForm.qti_json = JSON.stringify(this.qtiJson)
++            break
+           case ('ordering'):
+             this.questionForm.qti_prompt = this.qtiJson.prompt
+             this.questionForm.responses = this.qtiJson.responses
+diff --git a/resources/js/components/viewers/DiscussItComment.vue b/resources/js/components/viewers/DiscussItComment.vue
+new file mode 100644
+index 000000000..f5431f8e2
+--- /dev/null
++++ b/resources/js/components/viewers/DiscussItComment.vue
+@@ -0,0 +1,43 @@
++<template>
++  <div>
++    <p><strong>{{ comment.author }}</strong> <small>{{ comment.created_at }} UTC</small></p>
++    <p v-if="comment.text" class="response-text">{{ comment.text }}</p>
++    <button v-if="comment.media_id && !media" class="btn btn-outline-primary" type="button" @click="play">Load recording</button>
++    <video v-if="media && media.kind === 'video'" :src="media.url" controls playsinline crossorigin="anonymous" preload="metadata" @error="media = null">
++      <track v-if="captionUrl" kind="captions" :src="captionUrl" srclang="en" label="Captions" default>
++    </video>
++    <audio v-if="media && media.kind === 'audio'" :src="media.url" controls preload="metadata" @error="media = null" />
++    <details v-if="comment.captions"><summary>Transcript / captions</summary><pre>{{ comment.captions }}</pre></details>
++    <p v-if="!comment.deleted_at && !comment.satisfied" class="small">This response does not meet the minimum length for completion credit.</p>
++    <div v-if="editing">
++      <label>Response text<textarea v-model="editText" rows="4" maxlength="10000" /></label>
++      <label v-if="comment.media_id">Captions (WebVTT)<textarea v-model="editCaptions" rows="3" maxlength="20000" /></label>
++      <button class="btn btn-primary" type="button" @click="save">Save changes</button>
++      <button class="btn btn-outline-secondary" type="button" @click="editing = false">Cancel</button>
++    </div>
++    <button v-if="comment.can_edit && !editing" class="btn btn-outline-secondary" type="button" @click="edit">Edit text / captions</button>
++    <button v-if="comment.can_delete" class="btn btn-outline-danger" type="button" @click="remove">Remove response</button>
++  </div>
++</template>
++<script>
++import axios from 'axios'
++export default {
++  props: { comment: { type: Object, required: true }, base: { type: String, required: true } },
++  data: () => ({ media: null, captionUrl: '', editing: false, editText: '', editCaptions: '' }),
++  watch: { 'comment.captions': 'updateCaptions' },
++  mounted () { this.updateCaptions() },
++  beforeDestroy () { if (this.captionUrl) URL.revokeObjectURL(this.captionUrl) },
++  methods: {
++    report (error) { this.$emit('error', (error.response && error.response.data.message) || error.message) },
++    updateCaptions () { if (this.captionUrl) URL.revokeObjectURL(this.captionUrl); this.captionUrl = this.comment.captions && this.comment.captions.trim().startsWith('WEBVTT') ? URL.createObjectURL(new Blob([this.comment.captions], { type: 'text/vtt' })) : '' },
++    async play () { try { const { data } = await axios.get(`${this.base}/media/${this.comment.media_id}`); this.media = data } catch (error) { this.report(error) } },
++    edit () { this.editText = this.comment.text || ''; this.editCaptions = this.comment.captions || ''; this.editing = true },
++    async save () { try { await axios.patch(`${this.base}/comments/${this.comment.id}`, { text: this.editText, captions: this.editCaptions }); this.editing = false; this.$emit('changed') } catch (error) { this.report(error) } },
++    async remove () { if (!window.confirm('Remove this response from the discussion? Replies are retained.')) return; try { await axios.delete(`${this.base}/comments/${this.comment.id}`); this.$emit('changed') } catch (error) { this.report(error) } }
++  }
++}
++</script>
++<style scoped>
++video, audio { width: 100%; max-height: 65vh; } .response-text, pre { white-space: pre-wrap; overflow-wrap: anywhere; }
++.btn { min-height: 44px; margin: 4px; white-space: normal; } label, textarea { display: block; width: 100%; }
++</style>
+diff --git a/resources/js/components/viewers/DiscussItViewer.vue b/resources/js/components/viewers/DiscussItViewer.vue
+new file mode 100644
+index 000000000..ef29cfdb2
+--- /dev/null
++++ b/resources/js/components/viewers/DiscussItViewer.vue
+@@ -0,0 +1,149 @@
++<template>
++  <section class="discuss-it" aria-label="Discuss-It">
++    <h2 class="h4">Discuss-It</h2>
++    <div v-html="prompt || (qtiJson && qtiJson.prompt)" />
++    <p v-if="!assignmentId || !questionId">Discussion responses are available after this question is added to an assignment.</p>
++    <template v-else>
++      <p><a :href="`/discuss-it/${assignmentId}/${questionId}`" target="_blank" rel="noopener">Open full-screen discussion (recommended on mobile)</a></p>
++      <p v-if="error" role="alert" class="alert alert-danger">{{ error }}</p>
++      <p role="status">{{ status }}</p>
++      <details v-if="owner && settings" class="mb-3">
++        <summary>Instructor discussion settings</summary>
++        <fieldset :disabled="sending">
++          <label v-for="(label, key) in booleanSettings" :key="key"><input v-model="settings[key]" type="checkbox"> {{ label }}</label>
++          <label v-for="(label, key) in numberSettings" :key="key">{{ label }}<input v-model.number="settings[key]" type="number" min="0" :max="key === 'min_seconds' ? 300 : key === 'min_words' ? 1000 : 20"></label>
++          <p class="small">Completion and section rules lock after the first response. Moderating a graded post does not automatically retract its grade.</p>
++          <button class="btn btn-primary" type="button" @click="saveSettings">Save settings</button>
++        </fieldset>
++      </details>
++      <p v-if="settings && !settings.enabled">The instructor has not enabled this discussion.</p>
++      <template v-if="settings && settings.enabled">
++        <p v-if="!owner">{{ completion.threads }} / {{ settings.min_threads }} threads; {{ completion.replies }} / {{ settings.min_replies }} replies. {{ completion.complete ? 'Participation requirements met.' : '' }}</p>
++        <p>Each response: at least {{ settings.min_words }} word(s), or {{ settings.min_seconds }} seconds of audio/video. Maximum recording: 5 minutes / 80 MB.</p>
++        <button v-if="!composing" type="button" class="btn btn-primary" @click="compose(null)">Start a thread</button>
++        <section v-if="composing" ref="composer" tabindex="-1" class="composer">
++          <h3 class="h5">{{ parentId ? 'Reply to thread' : 'New thread' }}</h3>
++          <fieldset :disabled="sending || recordingBusy">
++            <label>Response type<select v-model="kind" @change="resetAttachment"><option value="text">Text</option><option value="video">Video</option><option value="audio">Audio</option></select></label>
++            <label v-if="owner && settings.group_by_section && !parentId">Section ID<input v-model="sectionId" type="number" min="1"></label>
++          </fieldset>
++          <fieldset :disabled="sending" aria-label="Recorder">
++            <VideoRecorder v-if="kind !== 'text'" :key="`${kind}-${recorderKey}`" :audio-only="kind === 'audio'" @recorded="recorded" @busy="recordingBusy = $event" />
++          </fieldset>
++          <label v-if="kind !== 'text'">Or upload an existing {{ kind }} (background effects apply only to recordings made above)
++            <input type="file" :accept="kind === 'video' ? 'video/mp4,video/webm,video/quicktime' : 'audio/*'" :disabled="sending || recordingBusy" @change="uploadFile">
++          </label>
++          <p v-if="attachmentName">Attached: {{ attachmentName }}</p>
++          <label>{{ kind === 'text' ? 'Your response' : 'Text alternative / description' }}<textarea v-model="text" maxlength="10000" rows="4" :disabled="sending" /></label>
++          <label v-if="kind !== 'text'">Optional captions (WebVTT)<textarea v-model="captions" maxlength="20000" rows="3" :disabled="sending" placeholder="WEBVTT" /></label>
++          <p v-if="kind !== 'text'" class="small">Automatic transcription is not enabled. Add a text alternative or your own captions.</p>
++          <button type="button" class="btn btn-primary" :disabled="sending || recordingBusy || (kind !== 'text' && !attachment)" @click="submit">{{ sending ? 'Submitting… keep this page open' : 'Submit response' }}</button>
++          <button type="button" class="btn btn-outline-secondary" :disabled="sending" @click="closeComposer">Cancel response</button>
++        </section>
++      </template>
++      <article v-for="thread in threads" :key="thread.id" class="thread">
++        <DiscussItComment :comment="thread" :base="base" @changed="load" @error="error = $event" />
++        <div v-for="reply in replies(thread.id)" :key="reply.id" class="reply"><DiscussItComment :comment="reply" :base="base" @changed="load" @error="error = $event" /></div>
++        <button v-if="settings.enabled && !thread.deleted_at && !composing" type="button" class="btn btn-outline-primary" @click="compose(thread.id)">Reply to {{ thread.author }}</button>
++      </article>
++      <p v-if="settings && settings.enabled && !threads.length">No responses yet. Start the conversation.</p>
++    </template>
++  </section>
++</template>
++
++<script>
++import axios from 'axios'
++import { v4 as uuid } from 'uuid'
++import VideoRecorder from '../recording/VideoRecorder'
++import DiscussItComment from './DiscussItComment'
++export default {
++  components: { VideoRecorder, DiscussItComment },
++  props: { assignmentId: { type: [Number, String], default: 0 }, questionId: { type: [Number, String], default: 0 }, qtiJson: { type: Object, default: null } },
++  data: () => ({ owner: false,
++    settings: null,
++    comments: [],
++    completion: {},
++    prompt: '',
++    error: '',
++    status: '',
++    composing: false,
++    parentId: null,
++    kind: 'video',
++    text: '',
++    captions: '',
++    sectionId: '',
++    attachment: null,
++    attachmentName: '',
++    mediaId: null,
++    requestId: '',
++    sending: false,
++    recordingBusy: false,
++    recorderKey: 0,
++    uploadTicket: null,
++    booleanSettings: { enabled: 'Enable discussion', auto_grade: 'Award completion credit automatically', allow_edit: 'Allow editing ungraded responses', allow_delete: 'Allow deleting ungraded responses', group_by_section: 'Separate discussions by course section' },
++    numberSettings: { min_threads: 'Required new threads', min_replies: 'Required replies', min_words: 'Minimum words for text', min_seconds: 'Minimum seconds for media' } }),
++  computed: { base () { return `/api/discuss-it/${this.assignmentId}/${this.questionId}` }, threads () { return this.comments.filter(comment => !comment.parent_id) } },
++  mounted () { this.load(); this.unload = event => { if (this.composing) { event.preventDefault(); event.returnValue = '' } }; window.addEventListener('beforeunload', this.unload) },
++  beforeDestroy () { this.disposed = true; window.removeEventListener('beforeunload', this.unload) },
++  methods: {
++    message (error) { return (error.response && error.response.data && error.response.data.message) || error.message || 'Request failed. Please retry.' },
++    async load () {
++      if (!this.assignmentId || !this.questionId) return
++      try { const { data } = await axios.get(this.base); this.owner = data.owner; this.settings = data.settings; this.comments = data.comments; this.completion = data.completion; this.prompt = data.prompt } catch (error) { this.error = this.message(error) }
++    },
++    async saveSettings () { try { await axios.put(`${this.base}/settings`, this.settings); this.error = ''; this.status = 'Settings saved.'; await this.load() } catch (error) { this.error = this.message(error) } },
++    replies (id) { return this.comments.filter(comment => comment.parent_id === id) },
++    compose (parentId) { this.parentId = parentId; this.composing = true; this.requestId = uuid(); this.status = ''; this.error = ''; this.$nextTick(() => this.$refs.composer.focus()) },
++    closeComposer () { if ((!this.attachment && !this.text && !this.recordingBusy) || window.confirm('Discard your unsent response?')) { this.composing = false; this.text = ''; this.captions = ''; this.resetAttachment() } },
++    resetAttachment () { this.attachment = null; this.attachmentName = ''; this.mediaId = null; this.uploadTicket = null; this.recorderKey++ },
++    recorded (result) { this.attachment = result ? result.blob : null; this.attachmentName = result ? `recording.${result.extension}` : ''; this.mediaId = null; this.uploadTicket = null },
++    uploadFile (event) {
++      const file = event.target.files[0]
++      if (!file) return
++      if (file.size > 80000000) { this.error = 'Choose a recording under 80 MB.'; return }
++      this.recorderKey++; this.$nextTick(() => { this.attachment = file; this.attachmentName = file.name; this.mediaId = null; this.uploadTicket = null })
++    },
++    async submit () {
++      this.error = ''; this.sending = true
++      try {
++        if (this.kind !== 'text') {
++          if (!this.mediaId) {
++            this.status = 'Requesting upload…'
++            if (!this.uploadTicket) {
++              const { data } = await axios.post(`${this.base}/uploads`, { kind: this.kind, size: this.attachment.size })
++              this.uploadTicket = data
++            }
++            const data = this.uploadTicket
++            this.status = 'Uploading recording…'
++            await axios.put(data.url, this.attachment, { headers: { 'Content-Type': this.attachment.type || 'application/octet-stream' }, timeout: 180000 })
++            this.mediaId = data.id
++          }
++          await axios.post(`${this.base}/media/${this.mediaId}/finalize`)
++          this.status = 'Processing recording for mobile playback… This may take a few minutes.'
++          let ready = false
++          for (let attempt = 0; attempt < 120; attempt++) {
++            if (this.disposed) return
++            const { data } = await axios.get(`${this.base}/media/${this.mediaId}`)
++            if (data.status === 'ready') { ready = true; break }
++            if (data.status === 'failed') { this.mediaId = null; this.uploadTicket = null; throw new Error(data.error) }
++            await new Promise(resolve => setTimeout(resolve, 3000))
++          }
++          if (!ready) throw new Error('Processing is still running. Your clip is retained; retry Submit shortly.')
++        }
++        await axios.post(`${this.base}/comments`, { request_id: this.requestId, parent_id: this.parentId, text: this.text, captions: this.captions, media_id: this.mediaId, group_key: `section:${this.sectionId}` })
++        this.composing = false; this.text = ''; this.captions = ''; this.resetAttachment(); this.status = 'Response submitted.'; await this.load()
++      } catch (error) { this.error = this.message(error); this.status = 'Not submitted. Your response remains available to retry.' } finally { this.sending = false }
++    }
++  }
++}
++</script>
++
++<style scoped>
++.discuss-it { width: 100%; max-width: 850px; margin: auto; overflow-wrap: anywhere; }
++.thread, .composer { padding: 16px; border: 1px solid #cbd5e1; border-radius: 12px; margin: 16px 0; }
++.reply { margin: 12px 0 12px 12px; border-left: 3px solid #cbd5e1; padding-left: 12px; }
++label { display: block; margin: 12px 0; } textarea, select, input[type=number], input[type=file] { display: block; width: 100%; max-width: 100%; min-height: 44px; font-size: 16px; }
++select { font: 16px system-ui; border: 1px solid #64748b; padding: 8px; }
++.btn, summary { min-height: 44px; padding: 10px 14px; margin: 4px 4px 4px 0; white-space: normal; }
++@media (max-width: 480px) { .thread, .composer { padding: 10px; } }
++</style>
+diff --git a/resources/js/pages/discuss-it.vue b/resources/js/pages/discuss-it.vue
+new file mode 100644
+index 000000000..a26b179d8
+--- /dev/null
++++ b/resources/js/pages/discuss-it.vue
+@@ -0,0 +1,5 @@
++<template><div class="discuss-it-page py-3"><DiscussItViewer :assignment-id="$route.params.assignmentId" :question-id="$route.params.questionId" /></div></template>
++<script>
++import DiscussItViewer from '../components/viewers/DiscussItViewer'
++export default { middleware: 'auth', components: { DiscussItViewer }, metaInfo: { title: 'Discuss-It' } }
++</script>
+diff --git a/resources/js/pages/questions.view.vue b/resources/js/pages/questions.view.vue
+index d325ca0d1..3c77e4e52 100644
+--- a/resources/js/pages/questions.view.vue
++++ b/resources/js/pages/questions.view.vue
+@@ -1886,6 +1886,8 @@
+                       <QtiJsonQuestionViewer
+                         :key="`qti-json-${currentPage}-${cacheIndex}-${questions[currentPage - 1].student_response}`"
+                         :qti-json="getQtiJson()['qtiJson']"
++                        :assignment-id="assignmentId"
++                        :question-id="questions[currentPage - 1].id"
+                         :student-response="questions[currentPage - 1].student_response"
+                         :show-submit="user.role === 3"
+                         :submit-button-active="getQtiJson()['submitButtonActive']"
+@@ -2070,6 +2072,7 @@
+         </b-container>
+         <b-container v-if="!showLearningTree && !caseStudyNotesByQuestion.length" id="questionContainer"
+                      ref="questionContainer"
++                     :class="{ 'discuss-it-assessment': isDiscussItQuestion }"
+         >
+           <b-row>
+             <Transition>
+@@ -2177,6 +2180,8 @@
+                             <QtiJsonQuestionViewer
+                               :key="`qti-json-${currentPage}-${cacheIndex}-${questions[currentPage - 1].student_response}`"
+                               :qti-json="getQtiJson()['qtiJson']"
++                              :assignment-id="assignmentId"
++                              :question-id="questions[currentPage - 1].id"
+                               :student-response="questions[currentPage - 1].student_response"
+                               :show-submit="user.role === 3"
+                               :submit-button-active="getQtiJson()['submitButtonActive']"
+@@ -3292,6 +3297,12 @@ export default {
+     originalOpenEndedSubmissionType: ''
+   }),
+   computed: {
++    isDiscussItQuestion () {
++      const question = this.questions[this.currentPage - 1]
++      if (!question) return false
++      if (question.qti_json_type === 'discuss_it') return true
++      try { return JSON.parse(question.qti_json).questionType === 'discuss_it' } catch (error) { return false }
++    },
+     ...mapGetters({
+       user: 'auth/user'
+     }),
+@@ -6322,6 +6333,13 @@ export default {
+ }
+ </script>
+ <style scoped>
++@media (max-width: 767px) {
++  #questionContainer.discuss-it-assessment { padding: 0; }
++  .discuss-it-assessment > .row { margin: 0; }
++  .discuss-it-assessment > .row > [class*="col-"] { flex: 0 0 100%; max-width: 100%; padding: 0; }
++  .discuss-it-assessment .sidebar-card { width: auto; max-width: 100%; }
++}
++
+ .v-enter-active,
+ .v-leave-active {
+   transition: opacity .75s ease;
+diff --git a/resources/js/router/routes.js b/resources/js/router/routes.js
+index d14b8bdb6..991160d6e 100644
+--- a/resources/js/router/routes.js
++++ b/resources/js/router/routes.js
+@@ -216,6 +216,7 @@ let general_paths = [
+   },
+   { path: '/question-in-iframe', name: 'question_in_iframe', component: page('iframe_test.vue') },
+   { path: '/embed/pronunciation', name: 'pronunciation.embed', component: page('pronunciation.embed.vue') },
++  { path: '/discuss-it/:assignmentId/:questionId', name: 'discuss-it', component: page('discuss-it.vue') },
+   {
+     path: '/assignments/:assignmentId/questions/view/:questionId?/:shownSections?',
+     name: 'questions.view',
+diff --git a/routes/api.php b/routes/api.php
+index 987b060b4..bf469b30f 100644
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -2,6 +2,8 @@
+ 
+ use Illuminate\Support\Facades\Route;
+ 
++Route::get('/discuss-it-media/{media}', 'DiscussItController@playback')->middleware('signed')->name('discuss-it.playback');
++
+ /*
+ |--------------------------------------------------------------------------
+ | API Routes
+@@ -75,6 +77,18 @@ Route::get('/time-zones', 'TimeZoneController@index');
+ 
+ Route::group(['middleware' => ['auth:api', 'throttle:240,1']], function () {
+ 
++    Route::prefix('discuss-it/{assignment}/{question}')->group(function () {
++        Route::get('/', 'DiscussItController@index');
++        Route::put('/settings', 'DiscussItController@settings');
++        Route::post('/comments', 'DiscussItController@store');
++        Route::patch('/comments/{comment}', 'DiscussItController@update');
++        Route::delete('/comments/{comment}', 'DiscussItController@destroy');
++        Route::post('/uploads', 'DiscussItController@upload')->middleware('throttle:10,1,discuss-it-upload');
++        Route::post('/media/{media}/finalize', 'DiscussItController@finalize');
++        Route::put('/media/{media}/content', 'DiscussItController@content')->middleware('throttle:10,1,discuss-it-content');
++        Route::get('/media/{media}', 'DiscussItController@media');
++    });
++
+     Route::get('/updated-information-first-application/{assignment}', 'UpdatedInformationFirstApplicationController@index');
+     Route::patch('/updated-information-first-application', 'UpdatedInformationFirstApplicationController@update');
+ 

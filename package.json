@@ -1,0 +1,21 @@
+{
+  "name": "@johnnylibretexts/discuss-it-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "On-device video recording, camera switching, mirroring and virtual backgrounds, with a Vue 2 adapter and ADAPT integration reference.",
+  "license": "MIT",
+  "exports": {
+    ".": "./resources/js/media/recording/Recorder.js",
+    "./vue2": "./resources/js/components/recording/VideoRecorder.vue"
+  },
+  "scripts": {
+    "build": "node scripts/build-discuss-it-assets.cjs",
+    "demo": "node scripts/demo.mjs",
+    "test": "node tests/discuss-it/background-image.mjs && node tests/discuss-it/recorder-browser.mjs",
+    "test:ui": "node tests/discuss-it/iphone-recovery.mjs",
+    "test:demo": "node tests/demo.mjs"
+  },
+  "dependencies": { "@mediapipe/tasks-vision": "0.10.32" },
+  "devDependencies": { "vue": "2.7.16", "playwright": "1.61.1" }
+}
